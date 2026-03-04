@@ -1,13 +1,31 @@
 # PowerShell script to configure IIS, ASP.NET Core Hosting Bundle, and Web Deploy
-# This script is executed by the Azure VM CustomScriptExtension during provisioning.
+# This script is executed during VM provisioning via Azure runCommands.
 
 $ErrorActionPreference = "Stop"
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $logFile = "C:\setup-iis.log"
 
 function Write-Log {
     param([string]$Message)
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     "$timestamp - $Message" | Tee-Object -FilePath $logFile -Append
+}
+
+function Download-WithRetry {
+    param([string]$Url, [string]$OutFile, [int]$MaxRetries = 3)
+    for ($i = 1; $i -le $MaxRetries; $i++) {
+        try {
+            Write-Log "  Download attempt $i of $MaxRetries: $Url"
+            $ProgressPreference = 'SilentlyContinue'
+            Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -TimeoutSec 300
+            Write-Log "  Download complete."
+            return
+        } catch {
+            Write-Log "  Download attempt $i failed: $_"
+            if ($i -eq $MaxRetries) { throw }
+            Start-Sleep -Seconds 10
+        }
+    }
 }
 
 Write-Log "Starting IIS and Web Deploy setup..."
@@ -23,33 +41,29 @@ Write-Log "IIS installed."
 # 2. Install ASP.NET Core 8.0 Hosting Bundle
 # --------------------------------------------------
 Write-Log "Downloading ASP.NET Core 8.0 Hosting Bundle..."
-$hostingBundleUrl = "https://download.visualstudio.microsoft.com/download/pr/2a7ae819-fbc4-4611-a1ba-f3b072d4ea25/32f3b931550f7b315d9827d564202571/dotnet-hosting-8.0.11-win.exe"
 $hostingBundlePath = "C:\dotnet-hosting-bundle.exe"
-Invoke-WebRequest -Uri $hostingBundleUrl -OutFile $hostingBundlePath -UseBasicParsing
+Download-WithRetry -Url "https://builds.dotnet.microsoft.com/dotnet/aspnetcore/Runtime/8.0.14/dotnet-hosting-8.0.14-win.exe" -OutFile $hostingBundlePath
 Write-Log "Installing ASP.NET Core 8.0 Hosting Bundle..."
-Start-Process -FilePath $hostingBundlePath -ArgumentList "/install", "/quiet", "/norestart" -Wait -NoNewWindow
-Write-Log "ASP.NET Core Hosting Bundle installed."
+$proc = Start-Process -FilePath $hostingBundlePath -ArgumentList "/install", "/quiet", "/norestart" -Wait -NoNewWindow -PassThru
+Write-Log "ASP.NET Core Hosting Bundle installer exited with code $($proc.ExitCode)."
 
 # --------------------------------------------------
-# 3. Install Web Deploy 3.6
+# 3. Install Web Deploy 4.0
 # --------------------------------------------------
 Write-Log "Downloading Web Deploy 3.6..."
-$webDeployUrl = "https://download.microsoft.com/download/0/1/D/01DC28EA-638C-4A22-A57B-4CEF97755C6C/WebDeploy_amd64_en-US.msi"
 $webDeployPath = "C:\WebDeploy_amd64.msi"
-Invoke-WebRequest -Uri $webDeployUrl -OutFile $webDeployPath -UseBasicParsing
-Write-Log "Installing Web Deploy 3.6..."
-Start-Process -FilePath "msiexec.exe" -ArgumentList "/i", $webDeployPath, "/quiet", "/norestart", "ADDLOCAL=ALL" -Wait -NoNewWindow
-Write-Log "Web Deploy installed."
+Download-WithRetry -Url "https://download.microsoft.com/download/0/1/D/01DC28EA-638C-4A22-A57B-4CEF97755C6C/WebDeploy_amd64_en-US.msi" -OutFile $webDeployPath
+Write-Log "Installing Web Deploy..."
+$proc = Start-Process -FilePath "msiexec.exe" -ArgumentList "/i", $webDeployPath, "/quiet", "/norestart", "ADDLOCAL=ALL" -Wait -NoNewWindow -PassThru
+Write-Log "Web Deploy installer exited with code $($proc.ExitCode)."
 
 # --------------------------------------------------
 # 4. Enable Web Management Service (WMSvc)
 # --------------------------------------------------
 Write-Log "Configuring Web Management Service..."
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\WebManagement\Server" -Name "EnableRemoteManagement" -Value 1
 Set-Service -Name WMSvc -StartupType Automatic
 Start-Service WMSvc
-# Allow remote connections
-Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\WebManagement\Server" -Name "EnableRemoteManagement" -Value 1
-Restart-Service WMSvc
 Write-Log "Web Management Service configured and started."
 
 # --------------------------------------------------
@@ -61,7 +75,6 @@ if (!(Test-Path $sitePath)) {
     New-Item -ItemType Directory -Path $sitePath -Force
 }
 
-# Remove default site and create our app site
 Import-Module WebAdministration
 if (Get-Website -Name "Default Web Site" -ErrorAction SilentlyContinue) {
     Remove-Website -Name "Default Web Site"
