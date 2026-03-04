@@ -124,6 +124,23 @@ DEPLOYMENT_OUTPUT=$(az deployment group create \
 VM_PUBLIC_IP=$(echo "$DEPLOYMENT_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['vmPublicIp']['value'])" 2>/dev/null || echo "unknown")
 VM_FQDN=$(echo "$DEPLOYMENT_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['vmFqdn']['value'])" 2>/dev/null || echo "unknown")
 WEBDEPLOY_URL=$(echo "$DEPLOYMENT_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['webDeployUrl']['value'])" 2>/dev/null || echo "unknown")
+VM_NAME=$(echo "$DEPLOYMENT_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['vmName']['value'])" 2>/dev/null || echo "${NAME_PREFIX}-vm")
+
+# Configure VM with IIS, Web Deploy, and ASP.NET Core Hosting Bundle
+echo ""
+echo "VM deployed. Now configuring IIS and Web Deploy (this may take 5-10 minutes)..."
+if ! az vm run-command create \
+  --resource-group "$RESOURCE_GROUP" \
+  --vm-name "$VM_NAME" \
+  --name "setup-iis" \
+  --location "$LOCATION" \
+  --script @"$SCRIPT_DIR/setup-iis.ps1" \
+  --timeout-in-seconds 600 \
+  --query 'instanceView.output' -o tsv; then
+  echo ""
+  echo "Error: VM setup script failed. RDP into the VM and check C:\\setup-iis.log for details."
+  exit 1
+fi
 
 echo ""
 echo "=== Deployment Complete ==="
@@ -134,17 +151,17 @@ echo "  Web Deploy URL:  $WEBDEPLOY_URL"
 echo ""
 echo "=== Next Steps ==="
 echo ""
-echo "1. Wait ~5 minutes for the VM setup script to finish installing IIS + Web Deploy."
-echo "   You can check progress by RDP'ing in and viewing C:\\setup-iis.log"
-echo ""
-echo "2. Add these GitHub Secrets to your repository:"
+echo "1. Add (or update) these GitHub Secrets in your repository:"
 echo "   WEBDEPLOY_URL      = $WEBDEPLOY_URL"
 echo "   WEBDEPLOY_USERNAME = $ADMIN_USERNAME"
 echo "   WEBDEPLOY_PASSWORD = <the password you just entered>"
 echo ""
-echo "3. Push your code to the 'main' branch to trigger the deployment workflow."
+echo "   ⚠️  If you destroyed and redeployed, the URL and IP have changed."
+echo "   Update WEBDEPLOY_URL in GitHub Secrets to match the new value above."
 echo ""
-echo "4. Test the app:"
+echo "2. Push your code to the 'main' branch to trigger the deployment workflow."
+echo ""
+echo "3. Test the app:"
 echo "   Browser:  http://$VM_PUBLIC_IP/"
 echo "   Health:   http://$VM_PUBLIC_IP/api/health"
 echo ""

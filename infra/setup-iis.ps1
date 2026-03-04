@@ -15,7 +15,7 @@ function Download-WithRetry {
     param([string]$Url, [string]$OutFile, [int]$MaxRetries = 3)
     for ($i = 1; $i -le $MaxRetries; $i++) {
         try {
-            Write-Log "  Download attempt $i of $MaxRetries: $Url"
+            Write-Log "  Download attempt $i of ${MaxRetries}: $Url"
             $ProgressPreference = 'SilentlyContinue'
             Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -TimeoutSec 300
             Write-Log "  Download complete."
@@ -48,7 +48,7 @@ $proc = Start-Process -FilePath $hostingBundlePath -ArgumentList "/install", "/q
 Write-Log "ASP.NET Core Hosting Bundle installer exited with code $($proc.ExitCode)."
 
 # --------------------------------------------------
-# 3. Install Web Deploy 4.0
+# 3. Install Web Deploy 3.6
 # --------------------------------------------------
 Write-Log "Downloading Web Deploy 3.6..."
 $webDeployPath = "C:\WebDeploy_amd64.msi"

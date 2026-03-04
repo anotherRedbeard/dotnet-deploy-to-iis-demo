@@ -178,19 +178,6 @@ resource vm 'Microsoft.Compute/virtualMachines@2023-09-01' = {
   }
 }
 
-resource vmSetupScript 'Microsoft.Compute/virtualMachines/runCommands@2023-09-01' = {
-  parent: vm
-  name: 'setup-iis'
-  location: location
-  properties: {
-    source: {
-      script: loadTextContent('setup-iis.ps1')
-    }
-    timeoutInSeconds: 600
-    asyncExecution: false
-  }
-}
-
 output vmPublicIp string = publicIp.properties.ipAddress
 output vmFqdn string = publicIp.properties.dnsSettings.fqdn
 output webDeployUrl string = 'https://${publicIp.properties.dnsSettings.fqdn}:8172/msdeploy.axd'
