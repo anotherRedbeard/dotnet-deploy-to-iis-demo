@@ -1,0 +1,261 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.41.2.15936",
+      "templateHash": "16162880143032924692"
+    }
+  },
+  "parameters": {
+    "adminUsername": {
+      "type": "string",
+      "metadata": {
+        "description": "Admin username for the VM"
+      }
+    },
+    "adminPassword": {
+      "type": "securestring",
+      "metadata": {
+        "description": "Admin password for the VM"
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Azure region for all resources"
+      }
+    },
+    "vmSize": {
+      "type": "string",
+      "defaultValue": "Standard_B2s",
+      "metadata": {
+        "description": "VM size"
+      }
+    },
+    "namePrefix": {
+      "type": "string",
+      "defaultValue": "iisdemo",
+      "metadata": {
+        "description": "Name prefix for all resources"
+      }
+    }
+  },
+  "variables": {
+    "$fxv#0": "# PowerShell script to configure IIS, ASP.NET Core Hosting Bundle, and Web Deploy\n# This script is executed by the Azure VM CustomScriptExtension during provisioning.\n\n$ErrorActionPreference = \"Stop\"\n$logFile = \"C:\\setup-iis.log\"\n\nfunction Write-Log {\n    param([string]$Message)\n    $timestamp = Get-Date -Format \"yyyy-MM-dd HH:mm:ss\"\n    \"$timestamp - $Message\" | Tee-Object -FilePath $logFile -Append\n}\n\nWrite-Log \"Starting IIS and Web Deploy setup...\"\n\n# --------------------------------------------------\n# 1. Install IIS with management tools\n# --------------------------------------------------\nWrite-Log \"Installing IIS...\"\nInstall-WindowsFeature -Name Web-Server, Web-Mgmt-Tools, Web-Mgmt-Service -IncludeManagementTools\nWrite-Log \"IIS installed.\"\n\n# --------------------------------------------------\n# 2. Install ASP.NET Core 8.0 Hosting Bundle\n# --------------------------------------------------\nWrite-Log \"Downloading ASP.NET Core 8.0 Hosting Bundle...\"\n$hostingBundleUrl = \"https://download.visualstudio.microsoft.com/download/pr/2a7ae819-fbc4-4611-a1ba-f3b072d4ea25/32f3b931550f7b315d9827d564202571/dotnet-hosting-8.0.11-win.exe\"\n$hostingBundlePath = \"C:\\dotnet-hosting-bundle.exe\"\nInvoke-WebRequest -Uri $hostingBundleUrl -OutFile $hostingBundlePath -UseBasicParsing\nWrite-Log \"Installing ASP.NET Core 8.0 Hosting Bundle...\"\nStart-Process -FilePath $hostingBundlePath -ArgumentList \"/install\", \"/quiet\", \"/norestart\" -Wait -NoNewWindow\nWrite-Log \"ASP.NET Core Hosting Bundle installed.\"\n\n# --------------------------------------------------\n# 3. Install Web Deploy 3.6\n# --------------------------------------------------\nWrite-Log \"Downloading Web Deploy 3.6...\"\n$webDeployUrl = \"https://download.microsoft.com/download/0/1/D/01DC28EA-638C-4A22-A57B-4CEF97755C6C/WebDeploy_amd64_en-US.msi\"\n$webDeployPath = \"C:\\WebDeploy_amd64.msi\"\nInvoke-WebRequest -Uri $webDeployUrl -OutFile $webDeployPath -UseBasicParsing\nWrite-Log \"Installing Web Deploy 3.6...\"\nStart-Process -FilePath \"msiexec.exe\" -ArgumentList \"/i\", $webDeployPath, \"/quiet\", \"/norestart\", \"ADDLOCAL=ALL\" -Wait -NoNewWindow\nWrite-Log \"Web Deploy installed.\"\n\n# --------------------------------------------------\n# 4. Enable Web Management Service (WMSvc)\n# --------------------------------------------------\nWrite-Log \"Configuring Web Management Service...\"\nSet-Service -Name WMSvc -StartupType Automatic\nStart-Service WMSvc\n# Allow remote connections\nSet-ItemProperty -Path \"HKLM:\\SOFTWARE\\Microsoft\\WebManagement\\Server\" -Name \"EnableRemoteManagement\" -Value 1\nRestart-Service WMSvc\nWrite-Log \"Web Management Service configured and started.\"\n\n# --------------------------------------------------\n# 5. Create IIS site for the app\n# --------------------------------------------------\nWrite-Log \"Creating IIS site...\"\n$sitePath = \"C:\\inetpub\\deploy-to-iis-demo\"\nif (!(Test-Path $sitePath)) {\n    New-Item -ItemType Directory -Path $sitePath -Force\n}\n\n# Remove default site and create our app site\nImport-Module WebAdministration\nif (Get-Website -Name \"Default Web Site\" -ErrorAction SilentlyContinue) {\n    Remove-Website -Name \"Default Web Site\"\n}\nNew-Website -Name \"DeployToIisDemo\" -PhysicalPath $sitePath -Port 80 -Force\nWrite-Log \"IIS site 'DeployToIisDemo' created at $sitePath.\"\n\n# --------------------------------------------------\n# 6. Configure firewall rules\n# --------------------------------------------------\nWrite-Log \"Configuring firewall rules...\"\nNew-NetFirewallRule -DisplayName \"Allow HTTP\" -Direction Inbound -Protocol TCP -LocalPort 80 -Action Allow -ErrorAction SilentlyContinue\nNew-NetFirewallRule -DisplayName \"Allow HTTPS\" -Direction Inbound -Protocol TCP -LocalPort 443 -Action Allow -ErrorAction SilentlyContinue\nNew-NetFirewallRule -DisplayName \"Allow Web Deploy\" -Direction Inbound -Protocol TCP -LocalPort 8172 -Action Allow -ErrorAction SilentlyContinue\nWrite-Log \"Firewall rules configured.\"\n\n# --------------------------------------------------\n# 7. Restart IIS to pick up the hosting bundle\n# --------------------------------------------------\nWrite-Log \"Restarting IIS...\"\n& iisreset /restart\nWrite-Log \"IIS restarted.\"\n\nWrite-Log \"Setup complete! VM is ready for Web Deploy.\"\n",
+    "vmName": "[format('{0}-vm', parameters('namePrefix'))]",
+    "nicName": "[format('{0}-nic', parameters('namePrefix'))]",
+    "nsgName": "[format('{0}-nsg', parameters('namePrefix'))]",
+    "vnetName": "[format('{0}-vnet', parameters('namePrefix'))]",
+    "subnetName": "default",
+    "publicIpName": "[format('{0}-pip', parameters('namePrefix'))]",
+    "dnsLabelPrefix": "[format('{0}-{1}', parameters('namePrefix'), uniqueString(resourceGroup().id))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2023-09-01",
+      "name": "[variables('nsgName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "securityRules": [
+          {
+            "name": "Allow-HTTP",
+            "properties": {
+              "priority": 100,
+              "direction": "Inbound",
+              "access": "Allow",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "80",
+              "sourceAddressPrefix": "*",
+              "destinationAddressPrefix": "*"
+            }
+          },
+          {
+            "name": "Allow-HTTPS",
+            "properties": {
+              "priority": 110,
+              "direction": "Inbound",
+              "access": "Allow",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "443",
+              "sourceAddressPrefix": "*",
+              "destinationAddressPrefix": "*"
+            }
+          },
+          {
+            "name": "Allow-WebDeploy",
+            "properties": {
+              "priority": 120,
+              "direction": "Inbound",
+              "access": "Allow",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "8172",
+              "sourceAddressPrefix": "*",
+              "destinationAddressPrefix": "*"
+            }
+          },
+          {
+            "name": "Allow-RDP",
+            "properties": {
+              "priority": 130,
+              "direction": "Inbound",
+              "access": "Allow",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "3389",
+              "sourceAddressPrefix": "*",
+              "destinationAddressPrefix": "*"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2023-09-01",
+      "name": "[variables('vnetName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "addressSpace": {
+          "addressPrefixes": [
+            "10.0.0.0/16"
+          ]
+        },
+        "subnets": [
+          {
+            "name": "[variables('subnetName')]",
+            "properties": {
+              "addressPrefix": "10.0.0.0/24",
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
+              }
+            }
+          }
+        ]
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Network/publicIPAddresses",
+      "apiVersion": "2023-09-01",
+      "name": "[variables('publicIpName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard"
+      },
+      "properties": {
+        "publicIPAllocationMethod": "Static",
+        "dnsSettings": {
+          "domainNameLabel": "[variables('dnsLabelPrefix')]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2023-09-01",
+      "name": "[variables('nicName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "ipConfigurations": [
+          {
+            "name": "ipconfig1",
+            "properties": {
+              "subnet": {
+                "id": "[reference(resourceId('Microsoft.Network/virtualNetworks', variables('vnetName')), '2023-09-01').subnets[0].id]"
+              },
+              "publicIPAddress": {
+                "id": "[resourceId('Microsoft.Network/publicIPAddresses', variables('publicIpName'))]"
+              }
+            }
+          }
+        ]
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/publicIPAddresses', variables('publicIpName'))]",
+        "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "apiVersion": "2023-09-01",
+      "name": "[variables('vmName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "hardwareProfile": {
+          "vmSize": "[parameters('vmSize')]"
+        },
+        "osProfile": {
+          "computerName": "[variables('vmName')]",
+          "adminUsername": "[parameters('adminUsername')]",
+          "adminPassword": "[parameters('adminPassword')]"
+        },
+        "storageProfile": {
+          "imageReference": {
+            "publisher": "MicrosoftWindowsServer",
+            "offer": "WindowsServer",
+            "sku": "2022-datacenter-azure-edition",
+            "version": "latest"
+          },
+          "osDisk": {
+            "createOption": "FromImage",
+            "managedDisk": {
+              "storageAccountType": "StandardSSD_LRS"
+            }
+          }
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
+            }
+          ]
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines/runCommands",
+      "apiVersion": "2023-09-01",
+      "name": "[format('{0}/{1}', variables('vmName'), 'setup-iis')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "source": {
+          "script": "[variables('$fxv#0')]"
+        },
+        "timeoutInSeconds": 600,
+        "asyncExecution": false
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Compute/virtualMachines', variables('vmName'))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "vmPublicIp": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Network/publicIPAddresses', variables('publicIpName')), '2023-09-01').ipAddress]"
+    },
+    "vmFqdn": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Network/publicIPAddresses', variables('publicIpName')), '2023-09-01').dnsSettings.fqdn]"
+    },
+    "webDeployUrl": {
+      "type": "string",
+      "value": "[format('https://{0}:8172/msdeploy.axd', reference(resourceId('Microsoft.Network/publicIPAddresses', variables('publicIpName')), '2023-09-01').dnsSettings.fqdn)]"
+    },
+    "vmName": {
+      "type": "string",
+      "value": "[variables('vmName')]"
+    }
+  }
+}

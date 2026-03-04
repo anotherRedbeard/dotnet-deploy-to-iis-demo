@@ -1,0 +1,82 @@
+name: Deploy to IIS via Web Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  APP_PROJECT: 'src/DeployToIisDemo/DeployToIisDemo.csproj'
+  PUBLISH_OUTPUT: './publish'
+  IIS_SITE_NAME: 'DeployToIisDemo'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore dependencies
+        run: dotnet restore ${{ env.APP_PROJECT }}
+
+      - name: Build
+        run: dotnet build ${{ env.APP_PROJECT }} --configuration Release --no-restore
+
+      - name: Publish
+        run: dotnet publish ${{ env.APP_PROJECT }} --configuration Release --no-build --output ${{ env.PUBLISH_OUTPUT }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: webapp-package
+          path: ${{ env.PUBLISH_OUTPUT }}
+          retention-days: 1
+
+  deploy:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: webapp-package
+          path: ./publish
+
+      - name: Deploy to IIS via Web Deploy
+        shell: powershell
+        env:
+          WEBDEPLOY_URL: ${{ secrets.WEBDEPLOY_URL }}
+          WEBDEPLOY_USERNAME: ${{ secrets.WEBDEPLOY_USERNAME }}
+          WEBDEPLOY_PASSWORD: ${{ secrets.WEBDEPLOY_PASSWORD }}
+        run: |
+          $msdeploy = "C:\Program Files\IIS\Microsoft Web Deploy V3\msdeploy.exe"
+
+          # If msdeploy is not found, install it
+          if (!(Test-Path $msdeploy)) {
+            Write-Host "Installing Web Deploy on runner..."
+            $installerUrl = "https://download.microsoft.com/download/0/1/D/01DC28EA-638C-4A22-A57B-4CEF97755C6C/WebDeploy_amd64_en-US.msi"
+            $installerPath = "$env:TEMP\WebDeploy.msi"
+            Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -UseBasicParsing
+            Start-Process msiexec.exe -ArgumentList "/i", $installerPath, "/quiet", "/norestart", "ADDLOCAL=ALL" -Wait -NoNewWindow
+          }
+
+          Write-Host "Deploying to IIS via Web Deploy..."
+          & $msdeploy `
+            -verb:sync `
+            -source:contentPath="$(Resolve-Path ./publish)" `
+            -dest:contentPath="${{ env.IIS_SITE_NAME }}",computerName="$env:WEBDEPLOY_URL",userName="$env:WEBDEPLOY_USERNAME",password="$env:WEBDEPLOY_PASSWORD",authType="Basic" `
+            -allowUntrusted `
+            -enableRule:AppOffline
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Web Deploy failed with exit code $LASTEXITCODE"
+            exit 1
+          }
+          Write-Host "Deployment successful!"

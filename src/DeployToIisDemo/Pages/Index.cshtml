@@ -1,0 +1,30 @@
+﻿@page
+@model IndexModel
+@{
+    ViewData["Title"] = "Home page";
+}
+
+<div class="text-center">
+    <h1 class="display-4">Deploy to IIS Demo</h1>
+    <p class="lead">.NET 8 ASP.NET Core app deployed to IIS on an Azure VM via GitHub Actions + Web Deploy</p>
+    <hr />
+    <div class="row justify-content-center mt-4">
+        <div class="col-md-6">
+            <div class="card">
+                <div class="card-body">
+                    <h5 class="card-title">App Info</h5>
+                    <ul class="list-group list-group-flush text-start">
+                        <li class="list-group-item"><strong>Machine:</strong> @Environment.MachineName</li>
+                        <li class="list-group-item"><strong>.NET Version:</strong> @Environment.Version</li>
+                        <li class="list-group-item"><strong>OS:</strong> @System.Runtime.InteropServices.RuntimeInformation.OSDescription</li>
+                        <li class="list-group-item"><strong>Time (UTC):</strong> @DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss")</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="mt-4">
+        <a href="/api/health" class="btn btn-primary">Health Check API</a>
+        <a href="/Privacy" class="btn btn-outline-secondary ms-2">Privacy</a>
+    </div>
+</div>
