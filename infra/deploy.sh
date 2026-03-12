@@ -9,6 +9,7 @@ LOCATION="eastus2"
 NAME_PREFIX="iisdemo"
 ADMIN_USERNAME="azureadmin"
 DESTROY=false
+DEPLOYMENT_CONTAINER="deployments"
 
 usage() {
   echo "Usage: $0 [-g resource-group] [-l location] [-p name-prefix] [-u admin-username] [--destroy]"
@@ -23,7 +24,6 @@ usage() {
   exit 0
 }
 
-# Parse long options first
 for arg in "$@"; do
   case $arg in
     --destroy) DESTROY=true; shift ;;
@@ -51,13 +51,11 @@ echo "  Name Prefix:     $NAME_PREFIX"
 echo "  Admin Username:  $ADMIN_USERNAME"
 echo ""
 
-# Check for Azure CLI
 if ! command -v az &> /dev/null; then
   echo "Error: Azure CLI (az) is not installed. Install it from https://aka.ms/install-azure-cli"
   exit 1
 fi
 
-# Check login status
 if ! az account show &> /dev/null; then
   echo "Not logged in to Azure. Running 'az login'..."
   az login
@@ -66,7 +64,6 @@ fi
 echo "Subscription: $(az account show --query '{name:name, id:id}' -o tsv)"
 echo ""
 
-# --- Destroy mode ---
 if [ "$DESTROY" = true ]; then
   echo "=== Destroying Infrastructure ==="
   echo ""
@@ -83,9 +80,6 @@ if [ "$DESTROY" = true ]; then
   exit 0
 fi
 
-# --- Deploy mode ---
-
-# Prompt for the VM admin password
 read -s -p "Enter VM admin password (min 12 chars, must include upper, lower, digit, special): " ADMIN_PASSWORD
 echo ""
 read -s -p "Confirm password: " ADMIN_PASSWORD_CONFIRM
@@ -101,12 +95,10 @@ if [ ${#ADMIN_PASSWORD} -lt 12 ]; then
   exit 1
 fi
 
-# Create resource group
 echo ""
 echo "Creating resource group '$RESOURCE_GROUP' in '$LOCATION'..."
 az group create --name "$RESOURCE_GROUP" --location "$LOCATION" --output none
 
-# Deploy Bicep template
 echo "Deploying infrastructure (this may take 5-10 minutes)..."
 DEPLOYMENT_OUTPUT=$(az deployment group create \
   --resource-group "$RESOURCE_GROUP" \
@@ -120,23 +112,21 @@ DEPLOYMENT_OUTPUT=$(az deployment group create \
   --query 'properties.outputs' \
   --output json)
 
-# Extract outputs
 VM_PUBLIC_IP=$(echo "$DEPLOYMENT_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['vmPublicIp']['value'])" 2>/dev/null || echo "unknown")
 VM_FQDN=$(echo "$DEPLOYMENT_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['vmFqdn']['value'])" 2>/dev/null || echo "unknown")
-WEBDEPLOY_URL=$(echo "$DEPLOYMENT_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['webDeployUrl']['value'])" 2>/dev/null || echo "unknown")
 VM_NAME=$(echo "$DEPLOYMENT_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['vmName']['value'])" 2>/dev/null || echo "${NAME_PREFIX}-vm")
+STORAGE_ACCOUNT_NAME=$(echo "$DEPLOYMENT_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['storageAccountName']['value'])" 2>/dev/null || echo "unknown")
+DEPLOYMENT_CONTAINER=$(echo "$DEPLOYMENT_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['storageContainerName']['value'])" 2>/dev/null || echo "$DEPLOYMENT_CONTAINER")
+SITE_NAME=$(echo "$DEPLOYMENT_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['siteName']['value'])" 2>/dev/null || echo "DeployToIisDemo")
 
-# Configure VM with IIS, Web Deploy, and ASP.NET Core Hosting Bundle
 echo ""
-echo "VM deployed. Now configuring IIS and Web Deploy (this may take 5-10 minutes)..."
-if ! az vm run-command create \
+echo "VM deployed. Now configuring IIS (this may take 5-10 minutes)..."
+if ! az vm run-command invoke \
   --resource-group "$RESOURCE_GROUP" \
-  --vm-name "$VM_NAME" \
-  --name "setup-iis" \
-  --location "$LOCATION" \
-  --script @"$SCRIPT_DIR/setup-iis.ps1" \
-  --timeout-in-seconds 600 \
-  --query 'instanceView.output' -o tsv; then
+  --name "$VM_NAME" \
+  --command-id RunPowerShellScript \
+  --scripts @"$SCRIPT_DIR/setup-iis.ps1" \
+  --query 'value[0].message' -o tsv; then
   echo ""
   echo "Error: VM setup script failed. RDP into the VM and check C:\\setup-iis.log for details."
   exit 1
@@ -145,23 +135,35 @@ fi
 echo ""
 echo "=== Deployment Complete ==="
 echo ""
-echo "  VM Public IP:    $VM_PUBLIC_IP"
-echo "  VM FQDN:         $VM_FQDN"
-echo "  Web Deploy URL:  $WEBDEPLOY_URL"
+echo "  VM Public IP:      $VM_PUBLIC_IP"
+echo "  VM FQDN:           $VM_FQDN"
+echo "  VM Name:           $VM_NAME"
+echo "  Storage Account:   $STORAGE_ACCOUNT_NAME"
+echo "  Blob Container:    $DEPLOYMENT_CONTAINER"
 echo ""
 echo "=== Next Steps ==="
 echo ""
-echo "1. Add (or update) these GitHub Secrets in your repository:"
-echo "   WEBDEPLOY_URL      = $WEBDEPLOY_URL"
-echo "   WEBDEPLOY_USERNAME = $ADMIN_USERNAME"
-echo "   WEBDEPLOY_PASSWORD = <the password you just entered>"
+echo "1. Create or update an Azure AD app/service principal for GitHub Actions OIDC."
+echo "   Grant it permissions to run VM commands and manage deployment blobs in this resource group."
 echo ""
-echo "   ⚠️  If you destroyed and redeployed, the URL and IP have changed."
-echo "   Update WEBDEPLOY_URL in GitHub Secrets to match the new value above."
+echo "2. Add these GitHub repository secrets for azure/login@v2:"
+echo "   AZURE_CLIENT_ID       = <app registration client ID>"
+echo "   AZURE_TENANT_ID       = <tenant ID>"
+echo "   AZURE_SUBSCRIPTION_ID = $(az account show --query id -o tsv)"
 echo ""
-echo "2. Push your code to the 'main' branch to trigger the deployment workflow."
+echo "3. Add these GitHub repository variables for the workflow:"
+echo "   AZURE_RESOURCE_GROUP  = $RESOURCE_GROUP"
+echo "   AZURE_VM_NAME         = $VM_NAME"
+echo "   AZURE_STORAGE_ACCOUNT = $STORAGE_ACCOUNT_NAME"
+echo "   AZURE_STORAGE_CONTAINER = $DEPLOYMENT_CONTAINER"
+echo "   IIS_SITE_NAME         = $SITE_NAME"
 echo ""
-echo "3. Test the app:"
+echo "4. Configure a federated credential on the Azure AD app for this repository/branch."
+echo "   The workflow will upload deployment packages to '$DEPLOYMENT_CONTAINER' and deploy via Azure VM Run Command."
+echo ""
+echo "5. Push your code to the 'main' branch to trigger the deployment workflow."
+echo ""
+echo "6. Test the app:"
 echo "   Browser:  http://$VM_PUBLIC_IP/"
 echo "   Health:   http://$VM_PUBLIC_IP/api/health"
 echo ""

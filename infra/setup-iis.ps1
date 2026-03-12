@@ -1,9 +1,12 @@
-# PowerShell script to configure IIS, ASP.NET Core Hosting Bundle, and Web Deploy
-# This script is executed during VM provisioning via Azure runCommands.
+# PowerShell script to configure IIS and the ASP.NET Core Hosting Bundle.
+# This script is executed during VM provisioning via Azure VM Run Command.
 
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $logFile = "C:\setup-iis.log"
+$siteName = "DeployToIisDemo"
+$appPoolName = "DeployToIisDemo"
+$sitePath = "C:\inetpub\deploy-to-iis-demo"
 
 function Write-Log {
     param([string]$Message)
@@ -20,7 +23,8 @@ function Download-WithRetry {
             Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -TimeoutSec 300
             Write-Log "  Download complete."
             return
-        } catch {
+        }
+        catch {
             Write-Log "  Download attempt $i failed: $_"
             if ($i -eq $MaxRetries) { throw }
             Start-Sleep -Seconds 10
@@ -28,18 +32,12 @@ function Download-WithRetry {
     }
 }
 
-Write-Log "Starting IIS and Web Deploy setup..."
+Write-Log "Starting IIS setup..."
 
-# --------------------------------------------------
-# 1. Install IIS with management tools
-# --------------------------------------------------
 Write-Log "Installing IIS..."
-Install-WindowsFeature -Name Web-Server, Web-Mgmt-Tools, Web-Mgmt-Service -IncludeManagementTools
+Install-WindowsFeature -Name Web-Server, Web-Mgmt-Tools -IncludeManagementTools
 Write-Log "IIS installed."
 
-# --------------------------------------------------
-# 2. Install ASP.NET Core 8.0 Hosting Bundle
-# --------------------------------------------------
 Write-Log "Downloading ASP.NET Core 8.0 Hosting Bundle..."
 $hostingBundlePath = "C:\dotnet-hosting-bundle.exe"
 Download-WithRetry -Url "https://builds.dotnet.microsoft.com/dotnet/aspnetcore/Runtime/8.0.14/dotnet-hosting-8.0.14-win.exe" -OutFile $hostingBundlePath
@@ -47,55 +45,37 @@ Write-Log "Installing ASP.NET Core 8.0 Hosting Bundle..."
 $proc = Start-Process -FilePath $hostingBundlePath -ArgumentList "/install", "/quiet", "/norestart" -Wait -NoNewWindow -PassThru
 Write-Log "ASP.NET Core Hosting Bundle installer exited with code $($proc.ExitCode)."
 
-# --------------------------------------------------
-# 3. Install Web Deploy 3.6
-# --------------------------------------------------
-Write-Log "Downloading Web Deploy 3.6..."
-$webDeployPath = "C:\WebDeploy_amd64.msi"
-Download-WithRetry -Url "https://download.microsoft.com/download/0/1/D/01DC28EA-638C-4A22-A57B-4CEF97755C6C/WebDeploy_amd64_en-US.msi" -OutFile $webDeployPath
-Write-Log "Installing Web Deploy..."
-$proc = Start-Process -FilePath "msiexec.exe" -ArgumentList "/i", $webDeployPath, "/quiet", "/norestart", "ADDLOCAL=ALL" -Wait -NoNewWindow -PassThru
-Write-Log "Web Deploy installer exited with code $($proc.ExitCode)."
-
-# --------------------------------------------------
-# 4. Enable Web Management Service (WMSvc)
-# --------------------------------------------------
-Write-Log "Configuring Web Management Service..."
-Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\WebManagement\Server" -Name "EnableRemoteManagement" -Value 1
-Set-Service -Name WMSvc -StartupType Automatic
-Start-Service WMSvc
-Write-Log "Web Management Service configured and started."
-
-# --------------------------------------------------
-# 5. Create IIS site for the app
-# --------------------------------------------------
 Write-Log "Creating IIS site..."
-$sitePath = "C:\inetpub\deploy-to-iis-demo"
 if (!(Test-Path $sitePath)) {
-    New-Item -ItemType Directory -Path $sitePath -Force
+    New-Item -ItemType Directory -Path $sitePath -Force | Out-Null
 }
 
 Import-Module WebAdministration
 if (Get-Website -Name "Default Web Site" -ErrorAction SilentlyContinue) {
     Remove-Website -Name "Default Web Site"
 }
-New-Website -Name "DeployToIisDemo" -PhysicalPath $sitePath -Port 80 -Force
-Write-Log "IIS site 'DeployToIisDemo' created at $sitePath."
 
-# --------------------------------------------------
-# 6. Configure firewall rules
-# --------------------------------------------------
+if (!(Test-Path "IIS:\AppPools\$appPoolName")) {
+    New-WebAppPool -Name $appPoolName | Out-Null
+}
+Set-ItemProperty "IIS:\AppPools\$appPoolName" -Name managedRuntimeVersion -Value ""
+
+if (Get-Website -Name $siteName -ErrorAction SilentlyContinue) {
+    Set-ItemProperty "IIS:\Sites\$siteName" -Name physicalPath -Value $sitePath
+}
+else {
+    New-Website -Name $siteName -PhysicalPath $sitePath -Port 80 -ApplicationPool $appPoolName -Force | Out-Null
+}
+Set-ItemProperty "IIS:\Sites\$siteName" -Name applicationPool -Value $appPoolName
+Write-Log "IIS site '$siteName' created at $sitePath."
+
 Write-Log "Configuring firewall rules..."
-New-NetFirewallRule -DisplayName "Allow HTTP" -Direction Inbound -Protocol TCP -LocalPort 80 -Action Allow -ErrorAction SilentlyContinue
-New-NetFirewallRule -DisplayName "Allow HTTPS" -Direction Inbound -Protocol TCP -LocalPort 443 -Action Allow -ErrorAction SilentlyContinue
-New-NetFirewallRule -DisplayName "Allow Web Deploy" -Direction Inbound -Protocol TCP -LocalPort 8172 -Action Allow -ErrorAction SilentlyContinue
+New-NetFirewallRule -DisplayName "Allow HTTP" -Direction Inbound -Protocol TCP -LocalPort 80 -Action Allow -ErrorAction SilentlyContinue | Out-Null
+New-NetFirewallRule -DisplayName "Allow HTTPS" -Direction Inbound -Protocol TCP -LocalPort 443 -Action Allow -ErrorAction SilentlyContinue | Out-Null
 Write-Log "Firewall rules configured."
 
-# --------------------------------------------------
-# 7. Restart IIS to pick up the hosting bundle
-# --------------------------------------------------
 Write-Log "Restarting IIS..."
 & iisreset /restart
 Write-Log "IIS restarted."
 
-Write-Log "Setup complete! VM is ready for Web Deploy."
+Write-Log "Setup complete! VM is ready for GitHub Actions deployments via Azure VM Run Command."

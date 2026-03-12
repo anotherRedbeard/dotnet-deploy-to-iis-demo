@@ -1,4 +1,4 @@
-// Deploy a Windows Server 2022 VM with IIS, ASP.NET Core Hosting Bundle, and Web Deploy
+// Deploy a Windows Server 2022 VM with IIS, ASP.NET Core Hosting Bundle, and deployment package storage
 
 @description('Admin username for the VM')
 param adminUsername string
@@ -23,6 +23,8 @@ var vnetName = '${namePrefix}-vnet'
 var subnetName = 'default'
 var publicIpName = '${namePrefix}-pip'
 var dnsLabelPrefix = '${namePrefix}-${uniqueString(resourceGroup().id)}'
+var storageAccountName = take('${toLower(replace(namePrefix, '-', ''))}${uniqueString(resourceGroup().id, namePrefix)}', 24)
+var deploymentContainerName = 'deployments'
 
 resource nsg 'Microsoft.Network/networkSecurityGroups@2023-09-01' = {
   name: nsgName
@@ -56,22 +58,9 @@ resource nsg 'Microsoft.Network/networkSecurityGroups@2023-09-01' = {
         }
       }
       {
-        name: 'Allow-WebDeploy'
-        properties: {
-          priority: 120
-          direction: 'Inbound'
-          access: 'Allow'
-          protocol: 'Tcp'
-          sourcePortRange: '*'
-          destinationPortRange: '8172'
-          sourceAddressPrefix: '*'
-          destinationAddressPrefix: '*'
-        }
-      }
-      {
         name: 'Allow-RDP'
         properties: {
-          priority: 130
+          priority: 120
           direction: 'Inbound'
           access: 'Allow'
           protocol: 'Tcp'
@@ -142,6 +131,35 @@ resource nic 'Microsoft.Network/networkInterfaces@2023-09-01' = {
   }
 }
 
+resource storageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' = {
+  name: storageAccountName
+  location: location
+  sku: {
+    name: 'Standard_LRS'
+  }
+  kind: 'StorageV2'
+  properties: {
+    accessTier: 'Hot'
+    allowBlobPublicAccess: false
+    allowSharedKeyAccess: true
+    minimumTlsVersion: 'TLS1_2'
+    supportsHttpsTrafficOnly: true
+  }
+}
+
+resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
+  parent: storageAccount
+  name: 'default'
+}
+
+resource deploymentContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
+  parent: blobService
+  name: deploymentContainerName
+  properties: {
+    publicAccess: 'None'
+  }
+}
+
 resource vm 'Microsoft.Compute/virtualMachines@2023-09-01' = {
   name: vmName
   location: location
@@ -180,5 +198,8 @@ resource vm 'Microsoft.Compute/virtualMachines@2023-09-01' = {
 
 output vmPublicIp string = publicIp.properties.ipAddress
 output vmFqdn string = publicIp.properties.dnsSettings.fqdn
-output webDeployUrl string = 'https://${publicIp.properties.dnsSettings.fqdn}:8172/msdeploy.axd'
+output resourceGroupName string = resourceGroup().name
 output vmName string = vm.name
+output storageAccountName string = storageAccount.name
+output storageContainerName string = deploymentContainer.name
+output siteName string = 'DeployToIisDemo'

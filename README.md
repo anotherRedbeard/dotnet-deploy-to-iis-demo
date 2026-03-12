@@ -1,28 +1,84 @@
-# Deploy .NET 8 to IIS on Azure VM via GitHub Actions
+# Deploy .NET 8 to IIS on an Azure VM via GitHub Actions + Azure OIDC
 
-A complete demo showing how to deploy an ASP.NET Core 8 application to IIS on a Windows Server Azure VM using GitHub Actions and Web Deploy (MSDeploy).
+This demo shows how to deploy an ASP.NET Core 8 application to IIS on a Windows Server Azure VM **without** storing VM credentials in GitHub.
+
+## What Changed
+
+This repository is moving from:
+
+- **Old flow:** GitHub Actions -> Web Deploy (MSDeploy) -> IIS VM using VM username/password secrets
+
+To:
+
+- **New flow:** GitHub Actions OIDC -> `azure/login` -> Azure Storage package upload -> Azure VM Run Command -> PowerShell deployment on the IIS VM
+
+That means GitHub no longer needs the VM administrator username/password to deploy.
+
+## Why This Is More Secure
+
+The new flow is safer because:
+
+- GitHub Actions authenticates to Azure with **short-lived OIDC tokens**, not a long-lived client secret or VM password.
+- The workflow deploys through the **Azure control plane** (`azure/login`, storage upload, VM Run Command) instead of logging directly into the VM.
+- You can scope Azure permissions with **RBAC**.
+- The VM admin password becomes a **break-glass / RDP credential**, not a CI/CD secret.
+- Once Web Deploy is retired, you no longer need to depend on port **8172** for deployments.
 
 ## What's Included
 
 | Component | Description |
 |-----------|-------------|
 | **ASP.NET Core 8 App** | Razor Pages frontend + `/api/health` API endpoint |
-| **Bicep Template** | Provisions a Windows Server 2022 VM with IIS, ASP.NET Core Hosting Bundle, and Web Deploy |
-| **PowerShell Setup Script** | Configures IIS, installs dependencies, creates the site |
-| **GitHub Actions Workflow** | Builds the app and deploys to IIS via Web Deploy on every push to `main` |
+| **Bicep / Infra Script** | Provisions the Windows Server VM and supporting Azure resources |
+| **PowerShell Setup Script** | Configures IIS and the application site on the VM |
+| **GitHub Actions Workflow** | Builds the app, uploads a package to Azure Storage, and tells the VM to deploy it |
+
+## End-to-End Deployment Flow
+
+On each deployment, the workflow should do the following:
+
+1. **Build and publish** the .NET app on the GitHub runner.
+2. **Authenticate to Azure** with `azure/login` using GitHub's OIDC token.
+3. **Upload** the published package to the Azure Storage account/container created for deployments.
+4. **Invoke Azure VM Run Command** against the IIS VM.
+5. **Run PowerShell on the VM** to download the package, stop/update the IIS site, copy files, and restart the app.
+6. **Verify** the app is healthy, typically by hitting `/api/health`.
 
 ## Prerequisites
 
-- Azure subscription
-- Azure CLI installed (`az` command)
-- GitHub account with a repository for this code
-- .NET 8 SDK (for local development)
+### Azure prerequisites
+
+You need:
+
+- An Azure subscription
+- Azure CLI installed (`az`)
+- Permission to create or update:
+  - resource groups
+  - storage accounts / containers
+  - virtual machines
+  - Microsoft Entra app registrations or service principals
+  - role assignments
+- Enough RBAC to assign roles at the resource group and storage account scopes
+  - `Owner` or `User Access Administrator` is the common setup
+
+### GitHub prerequisites
+
+You need:
+
+- A GitHub repository for this code
+- GitHub Actions enabled for the repository
+- Permission to create repository **Actions secrets and variables**
+- GitHub CLI installed (`gh`) if you want to configure variables from the command line
+
+### Local development prerequisites
+
+- .NET 8 SDK
 
 ## Quick Start
 
-### 1. Deploy the VM Infrastructure
+### 1. Deploy the Azure infrastructure
 
-Run the deploy script — it will create the resource group, deploy the VM, and print the outputs you need:
+Run the deploy script:
 
 ```bash
 ./infra/deploy.sh
@@ -41,46 +97,257 @@ You can customize the deployment with flags:
 | `-p` | Name prefix for resources | `iisdemo` |
 | `-u` | VM admin username | `azureadmin` |
 
-The script will prompt for the VM admin password and display the outputs when complete.
+> The script still prompts for a VM admin password because Windows needs a local admin account. That password is for RDP / recovery scenarios; **it is no longer a GitHub deployment secret**.
 
-> **Note on the setup script:** The Bicep template uses a `CustomScriptExtension` that downloads `setup-iis.ps1` from your GitHub repo's `main` branch. Make sure to push this repo to GitHub before deploying, or update the `fileUris` in `main.bicep` to point to the correct raw URL for your repo.
+### 2. Capture the infrastructure outputs
 
-### 2. Configure GitHub Secrets
+The updated infrastructure flow should expose or print the values the workflow needs. Expect outputs equivalent to these:
 
-In your GitHub repository, go to **Settings → Secrets and variables → Actions** and add:
+| Infra output | Example | Used for |
+|--------------|---------|----------|
+| `resourceGroupName` | `rg-iis-demo` | GitHub variable `AZURE_RESOURCE_GROUP` |
+| `vmName` | `iisdemo-vm` | GitHub variable `AZURE_VM_NAME` |
+| `storageAccountName` | `iisdemodeploy123` | GitHub variable `AZURE_STORAGE_ACCOUNT` |
+| `storageContainerName` | `deployments` | GitHub variable `AZURE_STORAGE_CONTAINER` |
+| `siteName` | `DeployToIisDemo` | GitHub variable `IIS_SITE_NAME` |
+| `vmPublicIp` | `20.42.10.15` | Manual browser / curl testing |
+| `vmFqdn` | `iisdemo-abc123.eastus2.cloudapp.azure.com` | Optional manual testing |
 
-| Secret | Value |
-|--------|-------|
-| `WEBDEPLOY_URL` | The `webDeployUrl` from the deployment output (e.g., `https://iisdemo-abc123.eastus2.cloudapp.azure.com:8172/msdeploy.axd`) |
-| `WEBDEPLOY_USERNAME` | `azureadmin` (or whatever you set in parameters) |
-| `WEBDEPLOY_PASSWORD` | The password you used during deployment |
+If your script prints slightly different output names, map the **equivalent values** into the GitHub variables above.
 
-### 3. Push Code and Deploy
+For the rest of this README, export those values into shell variables:
+
+```bash
+export GITHUB_OWNER="<your-github-user-or-org>"
+export GITHUB_REPO="<your-repo-name>"
+
+export RESOURCE_GROUP="<resourceGroupName output>"
+export VM_NAME="<vmName output>"
+export STORAGE_ACCOUNT="<storageAccountName output>"
+export STORAGE_CONTAINER="<storageContainerName output>"
+export SITE_NAME="<siteName output>"
+
+export SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+export TENANT_ID="$(az account show --query tenantId -o tsv)"
+```
+
+## One-Time Azure Setup for GitHub OIDC
+
+### 3. Create the Microsoft Entra application and service principal
+
+This application represents GitHub Actions when it deploys.
+
+```bash
+export APP_NAME="gh-${GITHUB_REPO}-deploy"
+
+export APP_ID="$(az ad app create \
+  --display-name "$APP_NAME" \
+  --query appId -o tsv)"
+
+export APP_OBJECT_ID="$(az ad app show \
+  --id "$APP_ID" \
+  --query id -o tsv)"
+
+export SP_OBJECT_ID="$(az ad sp create \
+  --id "$APP_ID" \
+  --query id -o tsv)"
+```
+
+Save `APP_ID`; that becomes the workflow's Azure client ID.
+
+### 4. Add the GitHub OIDC federated credential
+
+Create a federated credential that trusts deployments from your repository's `main` branch:
+
+```bash
+cat > federated-credential.json <<EOF_JSON
+{
+  "name": "github-main",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "subject": "repo:${GITHUB_OWNER}/${GITHUB_REPO}:ref:refs/heads/main",
+  "description": "GitHub Actions deployments from main",
+  "audiences": [
+    "api://AzureADTokenExchange"
+  ]
+}
+EOF_JSON
+
+az ad app federated-credential create \
+  --id "$APP_OBJECT_ID" \
+  --parameters @federated-credential.json
+
+rm federated-credential.json
+```
+
+If you also deploy from another branch or a GitHub Environment, add another federated credential with the matching `subject`.
+
+Examples:
+
+- Branch subject: `repo:OWNER/REPO:ref:refs/heads/release`
+- Environment subject: `repo:OWNER/REPO:environment:production`
+
+### 5. Grant Azure RBAC permissions
+
+The workflow needs permission to:
+
+- upload deployment packages to the storage account
+- invoke Run Command against the VM
+
+Create scopes:
+
+```bash
+export RG_SCOPE="$(az group show \
+  --name "$RESOURCE_GROUP" \
+  --query id -o tsv)"
+
+export STORAGE_SCOPE="$(az storage account show \
+  --resource-group "$RESOURCE_GROUP" \
+  --name "$STORAGE_ACCOUNT" \
+  --query id -o tsv)"
+```
+
+Assign roles:
+
+```bash
+az role assignment create \
+  --assignee-object-id "$SP_OBJECT_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Virtual Machine Contributor" \
+  --scope "$RG_SCOPE"
+
+az role assignment create \
+  --assignee-object-id "$SP_OBJECT_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Storage Blob Data Contributor" \
+  --scope "$STORAGE_SCOPE"
+```
+
+These assignments are enough for the documented flow in most demos:
+
+- `Virtual Machine Contributor` lets the workflow call VM Run Command on the target VM.
+- `Storage Blob Data Contributor` lets the workflow upload the package with Azure AD authentication.
+
+If your organization requires tighter permissions, replace these with a custom role later. Start here first so you can validate the pipeline end to end.
+
+## One-Time GitHub Repository Setup
+
+### 6. Configure repository Actions secrets and variables
+
+OIDC removes the need for a stored **VM credential**, but the workflow still needs Azure identity values for `azure/login`.
+
+Add these GitHub Actions **secrets**:
+
+- `AZURE_CLIENT_ID`
+- `AZURE_TENANT_ID`
+- `AZURE_SUBSCRIPTION_ID`
+
+Add these GitHub Actions **variables**:
+
+- `AZURE_RESOURCE_GROUP`
+- `AZURE_VM_NAME`
+- `AZURE_STORAGE_ACCOUNT`
+- `AZURE_STORAGE_CONTAINER`
+- `IIS_SITE_NAME`
+
+> **You should not need `WEBDEPLOY_URL`, `WEBDEPLOY_USERNAME`, or `WEBDEPLOY_PASSWORD` anymore.**
+
+Log in to GitHub CLI and target your repository:
+
+```bash
+gh auth login
+gh repo set-default "${GITHUB_OWNER}/${GITHUB_REPO}"
+```
+
+Create the secrets:
+
+```bash
+gh secret set AZURE_CLIENT_ID --body "$APP_ID"
+gh secret set AZURE_TENANT_ID --body "$TENANT_ID"
+gh secret set AZURE_SUBSCRIPTION_ID --body "$SUBSCRIPTION_ID"
+```
+
+Create the variables:
+
+```bash
+
+gh variable set AZURE_RESOURCE_GROUP --body "$RESOURCE_GROUP"
+gh variable set AZURE_VM_NAME --body "$VM_NAME"
+gh variable set AZURE_STORAGE_ACCOUNT --body "$STORAGE_ACCOUNT"
+gh variable set AZURE_STORAGE_CONTAINER --body "$STORAGE_CONTAINER"
+gh variable set IIS_SITE_NAME --body "$SITE_NAME"
+```
+
+If you prefer the GitHub web UI, go to:
+
+**Settings -> Secrets and variables -> Actions**
+
+Add the Azure identity values as **Secrets**, and add the resource names as **Variables**.
+
+### 7. Make sure the workflow can request an OIDC token
+
+The deployment job must request GitHub's OIDC token. In GitHub Actions that means the deploy job needs:
+
+```yaml
+permissions:
+  id-token: write
+  contents: read
+```
+
+And `azure/login` should use the repository secrets above:
+
+```yaml
+with:
+  client-id: ${{ secrets.AZURE_CLIENT_ID }}
+  tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+  subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+```
+
+## Deploy the Application
+
+### 8. Push code to `main`
 
 ```bash
 git add .
 git commit -m "Initial commit"
-git remote add origin https://github.com/<your-org>/deploy-to-iis-demo.git
+git remote add origin https://github.com/<your-org>/<your-repo-name>.git
 git push -u origin main
 ```
 
-The GitHub Actions workflow will automatically:
-1. Build the .NET 8 app
-2. Publish it as a deployment artifact
-3. Deploy to IIS via Web Deploy
+### 9. What the workflow should do
 
-### 4. Test the Deployment
+When the workflow runs successfully, expect this sequence:
 
-**From your browser:**
+1. `dotnet restore`
+2. `dotnet build`
+3. `dotnet publish`
+4. create a deployable package (typically zip)
+5. `azure/login` using GitHub OIDC
+6. upload the package to `AZURE_STORAGE_ACCOUNT` / `AZURE_STORAGE_CONTAINER`
+7. invoke `az vm run-command invoke` or equivalent on `AZURE_VM_NAME`
+8. run PowerShell on the VM to:
+   - download the package
+   - stop or drain the IIS site/app pool as needed
+   - replace application files
+   - start IIS again
+   - verify the deployed app
+
+## Test the Deployment
+
+Use the VM public IP or FQDN that the infrastructure deployment printed.
+
+**Browser**
+
 - Home page: `http://<vm-public-ip>/`
 - Health API: `http://<vm-public-ip>/api/health`
 
-**From the command line:**
+**Command line**
+
 ```bash
 curl http://<vm-public-ip>/api/health
 ```
 
-Expected health response:
+Expected response shape:
+
 ```json
 {
   "status": "Healthy",
@@ -91,68 +358,127 @@ Expected health response:
 }
 ```
 
+## How Infra Outputs Map to GitHub Configuration
+
+This is the most important hand-off between Azure infrastructure and GitHub Actions:
+
+| Azure / infra value | Where you get it | GitHub configuration |
+|---------------------|------------------|----------------------|
+| Azure tenant ID | `az account show --query tenantId -o tsv` | `AZURE_TENANT_ID` |
+| Azure subscription ID | `az account show --query id -o tsv` | `AZURE_SUBSCRIPTION_ID` |
+| Entra app client ID | `APP_ID` from `az ad app create` | `AZURE_CLIENT_ID` |
+| Resource group name | infra output / `deploy.sh` output | `AZURE_RESOURCE_GROUP` |
+| VM name | infra output / `deploy.sh` output | `AZURE_VM_NAME` |
+| Storage account name | infra output / `deploy.sh` output | `AZURE_STORAGE_ACCOUNT` |
+| Storage container name | infra output / `deploy.sh` output | `AZURE_STORAGE_CONTAINER` |
+| IIS site name | infra output / `deploy.sh` output | `IIS_SITE_NAME` |
+
+If the pipeline fails, double-check this mapping first. Most setup problems come from one of these values being copied incorrectly.
+
+## Troubleshooting
+
+### `azure/login` fails
+
+Check all of the following:
+
+- the workflow/job has `permissions: id-token: write`
+- `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_SUBSCRIPTION_ID` are correct
+- the federated credential subject exactly matches the repo and branch
+- you pushed to the same repo/branch you trusted in Azure
+
+To inspect the federated credential:
+
+```bash
+az ad app federated-credential list --id "$APP_OBJECT_ID" -o table
+```
+
+### Blob upload fails with 403 or authorization errors
+
+The OIDC identity probably does not have the right storage role.
+
+Verify the role assignment:
+
+```bash
+az role assignment list \
+  --assignee-object-id "$SP_OBJECT_ID" \
+  --scope "$STORAGE_SCOPE" \
+  -o table
+```
+
+Make sure `Storage Blob Data Contributor` is present.
+
+### VM Run Command fails with authorization errors
+
+Verify the VM role assignment:
+
+```bash
+az role assignment list \
+  --assignee-object-id "$SP_OBJECT_ID" \
+  --scope "$RG_SCOPE" \
+  -o table
+```
+
+Make sure `Virtual Machine Contributor` is present.
+
+### The package uploaded, but the VM deployment script failed
+
+Start with the Run Command output in the GitHub Actions job. If you need more detail, inspect the VM directly over RDP and review the PowerShell deployment logs on the machine.
+
+Also confirm:
+
+- `IIS_SITE_NAME` matches the site created by your setup script
+- the deployment script downloads from the expected storage account/container/blob path
+- the app files are being copied to the IIS site's physical path
+
+### The app still shows the old version
+
+Common causes:
+
+- the workflow uploaded a package but invoked Run Command against the wrong VM
+- `AZURE_VM_NAME` or `AZURE_RESOURCE_GROUP` points at an older environment
+- the IIS site/app pool was not restarted after file copy
+- the package was extracted into the wrong folder
+
+### VM setup script did not configure IIS correctly
+
+- Check the VM extension status in the Azure portal
+- RDP into the VM and review `C:\setup-iis.log`
+- Confirm the IIS site name printed by infrastructure matches `IIS_SITE_NAME`
+
 ## Project Structure
 
 ```
 deploy-to-iis-demo/
 ├── .github/
 │   └── workflows/
-│       └── deploy-to-iis.yml      # CI/CD pipeline
+│       └── deploy-to-iis.yml      # Build, Azure login, storage upload, VM Run Command deploy
 ├── infra/
-│   ├── main.bicep                  # Azure VM + networking
-│   ├── deploy.sh                   # One-command infra deployment
-│   ├── parameters.json             # Deployment parameters
-│   └── setup-iis.ps1               # VM configuration script
+│   ├── main.bicep                 # Azure VM + related resources
+│   ├── deploy.sh                  # One-command infrastructure deployment
+│   ├── deploy-app.ps1             # VM-side deployment script invoked by Run Command
+│   ├── parameters.json            # Deployment parameters
+│   └── setup-iis.ps1              # IIS and VM bootstrap script
 ├── src/
 │   └── DeployToIisDemo/
-│       ├── Pages/                  # Razor Pages
-│       ├── Program.cs              # App entry + health API
-│       ├── web.config              # IIS configuration
+│       ├── Pages/                 # Razor Pages
+│       ├── Program.cs             # App entry + health API
+│       ├── web.config             # IIS configuration
 │       └── DeployToIisDemo.csproj
 ├── DeployToIisDemo.sln
-├── global.json                     # .NET 8 SDK pin
+├── global.json                    # .NET 8 SDK pin
 └── README.md
 ```
-
-## Troubleshooting
-
-### Web Deploy connection refused
-- Verify the VM's NSG allows inbound traffic on port 8172
-- RDP into the VM and check that the Web Management Service (WMSvc) is running:
-  ```powershell
-  Get-Service WMSvc
-  ```
-- Check if Web Deploy is installed: `Get-Package -Name "Microsoft Web Deploy*"`
-
-### App shows 500 error after deployment
-- RDP into the VM and check the IIS logs: `C:\inetpub\logs\LogFiles\`
-- Check the ASP.NET Core stdout logs (if enabled in `web.config`)
-- Verify the ASP.NET Core Hosting Bundle is installed:
-  ```powershell
-  Get-ChildItem "HKLM:\SOFTWARE\dotnet\Setup\InstalledVersions\x64\sharedfx\Microsoft.AspNetCore.App"
-  ```
-
-### GitHub Actions workflow fails on deploy step
-- Ensure all three secrets (`WEBDEPLOY_URL`, `WEBDEPLOY_USERNAME`, `WEBDEPLOY_PASSWORD`) are set correctly
-- Check that the Web Deploy URL uses HTTPS and port 8172
-- The `-allowUntrusted` flag handles self-signed certs on the VM
-
-### VM setup script didn't run
-- Check the extension status in the Azure portal under VM → Extensions
-- RDP into the VM and check `C:\setup-iis.log`
 
 ## Future Migration to Azure PaaS
 
 When the customer is ready to move off the VM:
 
-1. **Azure App Service** — The most direct migration path. App Service runs IIS behind the scenes, so the app works as-is. Replace the Web Deploy target from the VM to an App Service publish profile.
-
-2. **Azure Container Apps** — Containerize the app with a Dockerfile and deploy to Container Apps for a more modern, scalable approach.
-
-3. **Infrastructure changes** — Swap the VM Bicep template for an App Service Bicep template. The app code itself requires zero changes.
+1. **Azure App Service** — The most direct path. Replace the VM deployment stage with an App Service deployment stage.
+2. **Azure Container Apps** — Containerize the app and move to a more cloud-native deployment model.
+3. **Infrastructure changes** — Swap the VM-focused Bicep template for an App Service or Container Apps template. The application code itself should require minimal change.
 
 ## Clean Up
 
 ```bash
-az group delete --name rg-iis-demo --yes --no-wait
+az group delete --name "$RESOURCE_GROUP" --yes --no-wait
 ```

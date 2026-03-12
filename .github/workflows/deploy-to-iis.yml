@@ -1,18 +1,26 @@
-name: Deploy to IIS via Web Deploy
+name: Deploy to IIS with Azure Run Command
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+  id-token: write
+
 env:
   DOTNET_VERSION: '8.0.x'
   APP_PROJECT: 'src/DeployToIisDemo/DeployToIisDemo.csproj'
   PUBLISH_OUTPUT: './publish'
-  IIS_SITE_NAME: 'DeployToIisDemo'
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+  AZURE_VM_NAME: ${{ vars.AZURE_VM_NAME }}
+  AZURE_STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT }}
+  AZURE_STORAGE_CONTAINER: ${{ vars.AZURE_STORAGE_CONTAINER }}
+  IIS_SITE_NAME: ${{ vars.IIS_SITE_NAME }}
 
 jobs:
-  build:
+  deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -32,51 +40,85 @@ jobs:
       - name: Publish
         run: dotnet publish ${{ env.APP_PROJECT }} --configuration Release --no-build --output ${{ env.PUBLISH_OUTPUT }}
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: webapp-package
-          path: ${{ env.PUBLISH_OUTPUT }}
-          retention-days: 1
-
-  deploy:
-    needs: build
-    runs-on: windows-latest
-    steps:
-      - name: Download build artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: webapp-package
-          path: ./publish
-
-      - name: Deploy to IIS via Web Deploy
-        shell: powershell
-        env:
-          WEBDEPLOY_URL: ${{ secrets.WEBDEPLOY_URL }}
-          WEBDEPLOY_USERNAME: ${{ secrets.WEBDEPLOY_USERNAME }}
-          WEBDEPLOY_PASSWORD: ${{ secrets.WEBDEPLOY_PASSWORD }}
+      - name: Create deployment package
         run: |
-          $msdeploy = "C:\Program Files\IIS\Microsoft Web Deploy V3\msdeploy.exe"
+          PACKAGE_PATH="${RUNNER_TEMP}/deploy-to-iis-demo-${GITHUB_SHA}.zip"
+          (cd "${PUBLISH_OUTPUT}" && zip -qr "$PACKAGE_PATH" .)
+          echo "PACKAGE_PATH=$PACKAGE_PATH" >> "$GITHUB_ENV"
 
-          # If msdeploy is not found, install it
-          if (!(Test-Path $msdeploy)) {
-            Write-Host "Installing Web Deploy on runner..."
-            $installerUrl = "https://download.microsoft.com/download/0/1/D/01DC28EA-638C-4A22-A57B-4CEF97755C6C/WebDeploy_amd64_en-US.msi"
-            $installerPath = "$env:TEMP\WebDeploy.msi"
-            Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -UseBasicParsing
-            Start-Process msiexec.exe -ArgumentList "/i", $installerPath, "/quiet", "/norestart", "ADDLOCAL=ALL" -Wait -NoNewWindow
-          }
+      - name: Validate Azure deployment configuration
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          missing=0
+          for name in AZURE_RESOURCE_GROUP AZURE_VM_NAME AZURE_STORAGE_ACCOUNT AZURE_STORAGE_CONTAINER IIS_SITE_NAME; do
+            if [ -z "${!name}" ]; then
+              echo "Missing required repository variable: $name" >&2
+              missing=1
+            fi
+          done
 
-          Write-Host "Deploying to IIS via Web Deploy..."
-          & $msdeploy `
-            -verb:sync `
-            -source:contentPath="$(Resolve-Path ./publish)" `
-            -dest:contentPath="${{ env.IIS_SITE_NAME }}",computerName="$env:WEBDEPLOY_URL",userName="$env:WEBDEPLOY_USERNAME",password="$env:WEBDEPLOY_PASSWORD",authType="Basic" `
-            -allowUntrusted `
-            -enableRule:AppOffline
+          for name in AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID; do
+            if [ -z "${!name}" ]; then
+              echo "Missing required repository secret: $name" >&2
+              missing=1
+            fi
+          done
 
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Web Deploy failed with exit code $LASTEXITCODE"
+          if [ "$missing" -ne 0 ]; then
             exit 1
-          }
-          Write-Host "Deployment successful!"
+          fi
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Upload package and generate SAS URL
+        run: |
+          BLOB_NAME="${GITHUB_RUN_ID}/${GITHUB_SHA}.zip"
+          az storage blob upload \
+            --account-name "$AZURE_STORAGE_ACCOUNT" \
+            --container-name "$AZURE_STORAGE_CONTAINER" \
+            --name "$BLOB_NAME" \
+            --file "$PACKAGE_PATH" \
+            --overwrite true \
+            --auth-mode login
+
+          EXPIRY_UTC="$(date -u -d '+1 hour' '+%Y-%m-%dT%H:%MZ')"
+          SAS_TOKEN="$(az storage blob generate-sas \
+            --account-name "$AZURE_STORAGE_ACCOUNT" \
+            --container-name "$AZURE_STORAGE_CONTAINER" \
+            --name "$BLOB_NAME" \
+            --permissions r \
+            --expiry "$EXPIRY_UTC" \
+            --https-only \
+            --as-user \
+            --auth-mode login \
+            --output tsv)"
+
+          PACKAGE_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_STORAGE_CONTAINER}/${BLOB_NAME}?${SAS_TOKEN}"
+          echo "DEPLOYMENT_BLOB_NAME=$BLOB_NAME" >> "$GITHUB_ENV"
+          echo "PACKAGE_URL=$PACKAGE_URL" >> "$GITHUB_ENV"
+
+      - name: Deploy package on VM
+        run: |
+          az vm run-command invoke \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$AZURE_VM_NAME" \
+            --command-id RunPowerShellScript \
+            --scripts @infra/deploy-app.ps1 \
+            --parameters "PackageUrl=$PACKAGE_URL" "SiteName=$IIS_SITE_NAME"
+
+      - name: Remove uploaded package
+        if: ${{ success() }}
+        run: |
+          az storage blob delete \
+            --account-name "$AZURE_STORAGE_ACCOUNT" \
+            --container-name "$AZURE_STORAGE_CONTAINER" \
+            --name "$DEPLOYMENT_BLOB_NAME" \
+            --auth-mode login
