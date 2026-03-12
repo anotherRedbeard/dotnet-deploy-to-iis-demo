@@ -102,8 +102,9 @@ jobs:
             --output tsv)"
 
           PACKAGE_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_STORAGE_CONTAINER}/${BLOB_NAME}?${SAS_TOKEN}"
+          PACKAGE_URL_BASE64="$(printf '%s' "$PACKAGE_URL" | base64 | tr -d '\n')"
           echo "DEPLOYMENT_BLOB_NAME=$BLOB_NAME" >> "$GITHUB_ENV"
-          echo "PACKAGE_URL=$PACKAGE_URL" >> "$GITHUB_ENV"
+          echo "PACKAGE_URL_BASE64=$PACKAGE_URL_BASE64" >> "$GITHUB_ENV"
 
       - name: Deploy package on VM
         run: |
@@ -112,7 +113,7 @@ jobs:
             --name "$AZURE_VM_NAME" \
             --command-id RunPowerShellScript \
             --scripts @infra/deploy-app.ps1 \
-            --parameters "PackageUrl=$PACKAGE_URL" "SiteName=$IIS_SITE_NAME"
+            --parameters "PackageUrlBase64=$PACKAGE_URL_BASE64" "SiteName=$IIS_SITE_NAME"
 
       - name: Remove uploaded package
         if: ${{ success() }}

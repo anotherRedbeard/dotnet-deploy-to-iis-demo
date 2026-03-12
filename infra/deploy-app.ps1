@@ -1,6 +1,7 @@
 param(
-    [Parameter(Mandatory = $true)]
     [string]$PackageUrl,
+
+    [string]$PackageUrlBase64,
 
     [string]$SitePath = "C:\inetpub\deploy-to-iis-demo",
 
@@ -48,6 +49,19 @@ $appOfflineContent = @"
 
 try {
     Write-Log "Starting application deployment."
+
+    if ([string]::IsNullOrWhiteSpace($PackageUrl)) {
+        if ([string]::IsNullOrWhiteSpace($PackageUrlBase64)) {
+            throw "Either PackageUrl or PackageUrlBase64 must be provided."
+        }
+
+        try {
+            $PackageUrl = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($PackageUrlBase64))
+        }
+        catch {
+            throw "PackageUrlBase64 could not be decoded as base64."
+        }
+    }
 
     New-Item -ItemType Directory -Path $workingPath -Force | Out-Null
     New-Item -ItemType Directory -Path $expandedPath -Force | Out-Null
