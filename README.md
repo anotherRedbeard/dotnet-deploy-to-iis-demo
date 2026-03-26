@@ -427,8 +427,18 @@ Start with the Run Command output in the GitHub Actions job. If you need more de
 Also confirm:
 
 - `IIS_SITE_NAME` matches the site created by your setup script
+- the workflow generated a valid HTTPS SAS URL for the uploaded blob
+- the storage account and container are reachable from the VM when that SAS URL is used
+- the SAS token has not expired before the VM tries to download the package
 - the deployment script downloads from the expected storage account/container/blob path
 - the app files are being copied to the IIS site's physical path
+
+Remember that these are two separate access steps:
+
+- the GitHub runner uploads the package to Azure Storage using `azure/login` and RBAC
+- the VM downloads the package by using the generated SAS URL
+
+So even if the upload succeeds, deployment can still fail if the SAS URL is invalid, expired, malformed, or blocked from reaching the storage endpoint.
 
 ### The app still shows the old version
 
