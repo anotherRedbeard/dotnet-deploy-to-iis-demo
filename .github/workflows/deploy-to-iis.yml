@@ -1,4 +1,4 @@
-name: Deploy to IIS with Azure Run Command
+name: Deploy to IIS from GitHub Release
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   id-token: write
 
 env:
@@ -15,8 +15,6 @@ env:
   PUBLISH_OUTPUT: './publish'
   AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
   AZURE_VM_NAME: ${{ vars.AZURE_VM_NAME }}
-  AZURE_STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT }}
-  AZURE_STORAGE_CONTAINER: ${{ vars.AZURE_STORAGE_CONTAINER }}
   IIS_SITE_NAME: ${{ vars.IIS_SITE_NAME }}
 
 jobs:
@@ -53,7 +51,7 @@ jobs:
           AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
         run: |
           missing=0
-          for name in AZURE_RESOURCE_GROUP AZURE_VM_NAME AZURE_STORAGE_ACCOUNT AZURE_STORAGE_CONTAINER IIS_SITE_NAME; do
+          for name in AZURE_RESOURCE_GROUP AZURE_VM_NAME IIS_SITE_NAME; do
             if [ -z "${!name}" ]; then
               echo "Missing required repository variable: $name" >&2
               missing=1
@@ -78,48 +76,45 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Upload package and generate SAS URL
+      - name: Create GitHub Release and publish deployment asset
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          BLOB_NAME="${GITHUB_RUN_ID}/${GITHUB_SHA}.zip"
-          az storage blob upload \
-            --account-name "$AZURE_STORAGE_ACCOUNT" \
-            --container-name "$AZURE_STORAGE_CONTAINER" \
-            --name "$BLOB_NAME" \
-            --file "$PACKAGE_PATH" \
-            --overwrite true \
-            --auth-mode login
+          RELEASE_TAG="deploy-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          RELEASE_NAME="Deployment run ${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+          PACKAGE_NAME="deploy-to-iis-demo-${GITHUB_SHA}.zip"
 
-          EXPIRY_UTC="$(date -u -d '+1 hour' '+%Y-%m-%dT%H:%MZ')"
-          SAS_TOKEN="$(az storage blob generate-sas \
-            --account-name "$AZURE_STORAGE_ACCOUNT" \
-            --container-name "$AZURE_STORAGE_CONTAINER" \
-            --name "$BLOB_NAME" \
-            --permissions r \
-            --expiry "$EXPIRY_UTC" \
-            --https-only \
-            --as-user \
-            --auth-mode login \
-            --output tsv)"
+          gh release create "$RELEASE_TAG" "$PACKAGE_PATH#${PACKAGE_NAME}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$RELEASE_NAME" \
+            --notes "Automated deployment package for commit ${GITHUB_SHA}."
 
-          PACKAGE_URL="https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_STORAGE_CONTAINER}/${BLOB_NAME}?${SAS_TOKEN}"
+          PACKAGE_URL="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+            --jq '.assets[] | select(.name == "'"${PACKAGE_NAME}"'") | .url')"
+
+          if [ -z "$PACKAGE_URL" ]; then
+            echo "Failed to resolve the release asset API URL." >&2
+            exit 1
+          fi
+
           PACKAGE_URL_BASE64="$(printf '%s' "$PACKAGE_URL" | base64 | tr -d '\n')"
-          echo "DEPLOYMENT_BLOB_NAME=$BLOB_NAME" >> "$GITHUB_ENV"
           echo "PACKAGE_URL_BASE64=$PACKAGE_URL_BASE64" >> "$GITHUB_ENV"
 
       - name: Deploy package on VM
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_RELEASE_DOWNLOAD_TOKEN: ${{ secrets.GITHUB_RELEASE_DOWNLOAD_TOKEN }}
         run: |
+          DOWNLOAD_TOKEN="${GITHUB_RELEASE_DOWNLOAD_TOKEN:-$GITHUB_TOKEN}"
+          PACKAGE_AUTH_TOKEN_BASE64="$(printf '%s' "$DOWNLOAD_TOKEN" | base64 | tr -d '\n')"
+
           az vm run-command invoke \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$AZURE_VM_NAME" \
             --command-id RunPowerShellScript \
             --scripts @infra/deploy-app.ps1 \
-            --parameters "PackageUrlBase64=$PACKAGE_URL_BASE64" "SiteName=$IIS_SITE_NAME"
-
-      - name: Remove uploaded package
-        if: ${{ success() }}
-        run: |
-          az storage blob delete \
-            --account-name "$AZURE_STORAGE_ACCOUNT" \
-            --container-name "$AZURE_STORAGE_CONTAINER" \
-            --name "$DEPLOYMENT_BLOB_NAME" \
-            --auth-mode login
+            --parameters \
+              "PackageUrlBase64=$PACKAGE_URL_BASE64" \
+              "PackageAuthTokenBase64=$PACKAGE_AUTH_TOKEN_BASE64" \
+              "PackageAuthHeaderScheme=Bearer" \
+              "SiteName=$IIS_SITE_NAME"

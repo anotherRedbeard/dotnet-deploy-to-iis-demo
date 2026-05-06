@@ -3,6 +3,12 @@ param(
 
     [string]$PackageUrlBase64,
 
+    [string]$PackageAuthToken,
+
+    [string]$PackageAuthTokenBase64,
+
+    [string]$PackageAuthHeaderScheme = "Bearer",
+
     [string]$SitePath = "C:\inetpub\deploy-to-iis-demo",
 
     [string]$SiteName = "DeployToIisDemo"
@@ -63,6 +69,15 @@ try {
         }
     }
 
+    if ([string]::IsNullOrWhiteSpace($PackageAuthToken) -and -not [string]::IsNullOrWhiteSpace($PackageAuthTokenBase64)) {
+        try {
+            $PackageAuthToken = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($PackageAuthTokenBase64))
+        }
+        catch {
+            throw "PackageAuthTokenBase64 could not be decoded as base64."
+        }
+    }
+
     New-Item -ItemType Directory -Path $workingPath -Force | Out-Null
     New-Item -ItemType Directory -Path $expandedPath -Force | Out-Null
     if (!(Test-Path $SitePath)) {
@@ -71,7 +86,20 @@ try {
 
     Write-Log "Downloading deployment package."
     $ProgressPreference = 'SilentlyContinue'
-    Invoke-WebRequest -Uri $PackageUrl -OutFile $packagePath -UseBasicParsing -TimeoutSec 300
+    $packageHeaders = @{
+        'User-Agent' = 'deploy-to-iis-demo'
+    }
+
+    if ($PackageUrl -like 'https://api.github.com/*' -or $PackageUrl -like 'https://uploads.github.com/*') {
+        $packageHeaders['Accept'] = 'application/octet-stream'
+        $packageHeaders['X-GitHub-Api-Version'] = '2022-11-28'
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($PackageAuthToken)) {
+        $packageHeaders['Authorization'] = "$PackageAuthHeaderScheme $PackageAuthToken"
+    }
+
+    Invoke-WebRequest -Uri $PackageUrl -Headers $packageHeaders -OutFile $packagePath -UseBasicParsing -TimeoutSec 300
 
     Write-Log "Expanding deployment package."
     Expand-Archive -Path $packagePath -DestinationPath $expandedPath -Force

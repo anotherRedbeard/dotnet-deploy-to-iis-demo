@@ -1,4 +1,4 @@
-# Deploy .NET 8 to IIS on an Azure VM via GitHub Actions + Azure OIDC
+# Deploy .NET 8 to IIS from a GitHub Release via GitHub Actions + Azure OIDC
 
 This demo shows how to deploy an ASP.NET Core 8 application to IIS on a Windows Server Azure VM **without** storing VM credentials in GitHub.
 
@@ -10,7 +10,7 @@ This repository is moving from:
 
 To:
 
-- **New flow:** GitHub Actions OIDC -> `azure/login` -> Azure Storage package upload -> Azure VM Run Command -> PowerShell deployment on the IIS VM
+- **New flow:** GitHub Actions -> GitHub Release asset -> Azure VM Run Command -> PowerShell deployment on the IIS VM
 
 That means GitHub no longer needs the VM administrator username/password to deploy.
 
@@ -19,7 +19,8 @@ That means GitHub no longer needs the VM administrator username/password to depl
 The new flow is safer because:
 
 - GitHub Actions authenticates to Azure with **short-lived OIDC tokens**, not a long-lived client secret or VM password.
-- The workflow deploys through the **Azure control plane** (`azure/login`, storage upload, VM Run Command) instead of logging directly into the VM.
+- The workflow deploys through the **Azure control plane** (`azure/login`, VM Run Command) instead of logging directly into the VM.
+- The deployment package can be distributed from **GitHub Releases**, which is closer to how an on-prem server would pull a versioned artifact.
 - You can scope Azure permissions with **RBAC**.
 - The VM admin password becomes a **break-glass / RDP credential**, not a CI/CD secret.
 - Once Web Deploy is retired, you no longer need to depend on port **8172** for deployments.
@@ -31,7 +32,7 @@ The new flow is safer because:
 | **ASP.NET Core 8 App** | Razor Pages frontend + `/api/health` API endpoint |
 | **Bicep / Infra Script** | Provisions the Windows Server VM and supporting Azure resources |
 | **PowerShell Setup Script** | Configures IIS and the application site on the VM |
-| **GitHub Actions Workflow** | Builds the app, uploads a package to Azure Storage, and tells the VM to deploy it |
+| **GitHub Actions Workflow** | Builds the app, publishes a release asset, and tells the VM to deploy it |
 
 ## End-to-End Deployment Flow
 
@@ -39,9 +40,9 @@ On each deployment, the workflow should do the following:
 
 1. **Build and publish** the .NET app on the GitHub runner.
 2. **Authenticate to Azure** with `azure/login` using GitHub's OIDC token.
-3. **Upload** the published package to the Azure Storage account/container created for deployments.
+3. **Create a GitHub Release** for the run and upload the published package as a release asset.
 4. **Invoke Azure VM Run Command** against the IIS VM.
-5. **Run PowerShell on the VM** to download the package, stop/update the IIS site, copy files, and restart the app.
+5. **Run PowerShell on the VM** to download the release asset, stop/update the IIS site, copy files, and restart the app.
 6. **Verify** the app is healthy, typically by hitting `/api/health`.
 
 ## Prerequisites
@@ -58,7 +59,7 @@ You need:
   - virtual machines
   - Microsoft Entra app registrations or service principals
   - role assignments
-- Enough RBAC to assign roles at the resource group and storage account scopes
+- Enough RBAC to assign roles at the resource group scope
   - `Owner` or `User Access Administrator` is the common setup
 
 ### GitHub prerequisites
@@ -107,8 +108,6 @@ The updated infrastructure flow should expose or print the values the workflow n
 |--------------|---------|----------|
 | `resourceGroupName` | `rg-iis-demo` | GitHub variable `AZURE_RESOURCE_GROUP` |
 | `vmName` | `iisdemo-vm` | GitHub variable `AZURE_VM_NAME` |
-| `storageAccountName` | `iisdemodeploy123` | GitHub variable `AZURE_STORAGE_ACCOUNT` |
-| `storageContainerName` | `deployments` | GitHub variable `AZURE_STORAGE_CONTAINER` |
 | `siteName` | `DeployToIisDemo` | GitHub variable `IIS_SITE_NAME` |
 | `vmPublicIp` | `20.42.10.15` | Manual browser / curl testing |
 | `vmFqdn` | `iisdemo-abc123.eastus2.cloudapp.azure.com` | Optional manual testing |
@@ -123,8 +122,6 @@ export GITHUB_REPO="<your-repo-name>"
 
 export RESOURCE_GROUP="<resourceGroupName output>"
 export VM_NAME="<vmName output>"
-export STORAGE_ACCOUNT="<storageAccountName output>"
-export STORAGE_CONTAINER="<storageContainerName output>"
 export SITE_NAME="<siteName output>"
 
 export SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
@@ -188,10 +185,7 @@ Examples:
 
 ### 5. Grant Azure RBAC permissions
 
-The workflow needs permission to:
-
-- upload deployment packages to the storage account
-- invoke Run Command against the VM
+The workflow needs permission to invoke Run Command against the VM.
 
 Create scopes:
 
@@ -200,32 +194,16 @@ export RG_SCOPE="$(az group show \
   --name "$RESOURCE_GROUP" \
   --query id -o tsv)"
 
-export STORAGE_SCOPE="$(az storage account show \
-  --resource-group "$RESOURCE_GROUP" \
-  --name "$STORAGE_ACCOUNT" \
-  --query id -o tsv)"
-```
-
-Assign roles:
-
-```bash
 az role assignment create \
   --assignee-object-id "$SP_OBJECT_ID" \
   --assignee-principal-type ServicePrincipal \
   --role "Virtual Machine Contributor" \
   --scope "$RG_SCOPE"
-
-az role assignment create \
-  --assignee-object-id "$SP_OBJECT_ID" \
-  --assignee-principal-type ServicePrincipal \
-  --role "Storage Blob Data Contributor" \
-  --scope "$STORAGE_SCOPE"
 ```
 
 These assignments are enough for the documented flow in most demos:
 
 - `Virtual Machine Contributor` lets the workflow call VM Run Command on the target VM.
-- `Storage Blob Data Contributor` lets the workflow upload the package with Azure AD authentication.
 
 If your organization requires tighter permissions, replace these with a custom role later. Start here first so you can validate the pipeline end to end.
 
@@ -245,9 +223,13 @@ Add these GitHub Actions **variables**:
 
 - `AZURE_RESOURCE_GROUP`
 - `AZURE_VM_NAME`
-- `AZURE_STORAGE_ACCOUNT`
-- `AZURE_STORAGE_CONTAINER`
 - `IIS_SITE_NAME`
+
+Optional GitHub Actions **secret**:
+
+- `GITHUB_RELEASE_DOWNLOAD_TOKEN`
+
+> The demo workflow can fall back to the per-run `GITHUB_TOKEN` when it immediately deploys the release asset to the Azure VM. For a real on-prem pull model against a private repository, use a dedicated fine-grained PAT or GitHub App token instead.
 
 > **You should not need `WEBDEPLOY_URL`, `WEBDEPLOY_USERNAME`, or `WEBDEPLOY_PASSWORD` anymore.**
 
@@ -272,9 +254,13 @@ Create the variables:
 
 gh variable set AZURE_RESOURCE_GROUP --body "$RESOURCE_GROUP"
 gh variable set AZURE_VM_NAME --body "$VM_NAME"
-gh variable set AZURE_STORAGE_ACCOUNT --body "$STORAGE_ACCOUNT"
-gh variable set AZURE_STORAGE_CONTAINER --body "$STORAGE_CONTAINER"
 gh variable set IIS_SITE_NAME --body "$SITE_NAME"
+```
+
+Optional secret for private release downloads:
+
+```bash
+gh secret set GITHUB_RELEASE_DOWNLOAD_TOKEN --body "<fine-grained-pat-or-installation-token>"
 ```
 
 If you prefer the GitHub web UI, go to:
@@ -290,7 +276,7 @@ The deployment job must request GitHub's OIDC token. In GitHub Actions that mean
 ```yaml
 permissions:
   id-token: write
-  contents: read
+  contents: write
 ```
 
 And `azure/login` should use the repository secrets above:
@@ -321,11 +307,11 @@ When the workflow runs successfully, expect this sequence:
 2. `dotnet build`
 3. `dotnet publish`
 4. create a deployable package (typically zip)
-5. `azure/login` using GitHub OIDC
-6. upload the package to `AZURE_STORAGE_ACCOUNT` / `AZURE_STORAGE_CONTAINER`
+5. create a GitHub Release for the workflow run and upload the zip as a release asset
+6. `azure/login` using GitHub OIDC
 7. invoke `az vm run-command invoke` or equivalent on `AZURE_VM_NAME`
 8. run PowerShell on the VM to:
-   - download the package
+   - download the release asset from GitHub
    - stop or drain the IIS site/app pool as needed
    - replace application files
    - start IIS again
@@ -369,8 +355,6 @@ This is the most important hand-off between Azure infrastructure and GitHub Acti
 | Entra app client ID | `APP_ID` from `az ad app create` | `AZURE_CLIENT_ID` |
 | Resource group name | infra output / `deploy.sh` output | `AZURE_RESOURCE_GROUP` |
 | VM name | infra output / `deploy.sh` output | `AZURE_VM_NAME` |
-| Storage account name | infra output / `deploy.sh` output | `AZURE_STORAGE_ACCOUNT` |
-| Storage container name | infra output / `deploy.sh` output | `AZURE_STORAGE_CONTAINER` |
 | IIS site name | infra output / `deploy.sh` output | `IIS_SITE_NAME` |
 
 If the pipeline fails, double-check this mapping first. Most setup problems come from one of these values being copied incorrectly.
@@ -392,20 +376,13 @@ To inspect the federated credential:
 az ad app federated-credential list --id "$APP_OBJECT_ID" -o table
 ```
 
-### Blob upload fails with 403 or authorization errors
+### GitHub Release creation fails
 
-The OIDC identity probably does not have the right storage role.
+Check all of the following:
 
-Verify the role assignment:
-
-```bash
-az role assignment list \
-  --assignee-object-id "$SP_OBJECT_ID" \
-  --scope "$STORAGE_SCOPE" \
-  -o table
-```
-
-Make sure `Storage Blob Data Contributor` is present.
+- the workflow/job has `permissions: contents: write`
+- the repository allows the workflow to create releases
+- the generated tag for the run does not already exist
 
 ### VM Run Command fails with authorization errors
 
@@ -427,18 +404,17 @@ Start with the Run Command output in the GitHub Actions job. If you need more de
 Also confirm:
 
 - `IIS_SITE_NAME` matches the site created by your setup script
-- the workflow generated a valid HTTPS SAS URL for the uploaded blob
-- the storage account and container are reachable from the VM when that SAS URL is used
-- the SAS token has not expired before the VM tries to download the package
-- the deployment script downloads from the expected storage account/container/blob path
+- the VM can reach `github.com` / `api.github.com` over HTTPS
+- the release asset URL points to the expected repository and asset
+- the deployment token can read private release assets if the repository is private
 - the app files are being copied to the IIS site's physical path
 
-Remember that these are two separate access steps:
+Remember that there are two separate access steps:
 
-- the GitHub runner uploads the package to Azure Storage using `azure/login` and RBAC
-- the VM downloads the package by using the generated SAS URL
+- the GitHub runner creates the release and uploads the asset
+- the VM downloads the asset from GitHub during deployment
 
-So even if the upload succeeds, deployment can still fail if the SAS URL is invalid, expired, malformed, or blocked from reaching the storage endpoint.
+So even if release creation succeeds, deployment can still fail if outbound GitHub access is blocked or the VM cannot authenticate to a private release asset.
 
 ### The app still shows the old version
 
@@ -461,7 +437,7 @@ Common causes:
 deploy-to-iis-demo/
 ├── .github/
 │   └── workflows/
-│       └── deploy-to-iis.yml      # Build, Azure login, storage upload, VM Run Command deploy
+│       └── deploy-to-iis.yml      # Build, GitHub Release asset publish, Azure Run Command deploy
 ├── infra/
 │   ├── main.bicep                 # Azure VM + related resources
 │   ├── deploy.sh                  # One-command infrastructure deployment
